@@ -1,11 +1,3 @@
-# Remove all old versions and install matching set
-Uninstall-Module Microsoft.Graph.Applications -AllVersions -Force
-Uninstall-Module Microsoft.Graph.Authentication -AllVersions -Force
-Install-Module Microsoft.Graph.Authentication -Force -Scope CurrentUser
-Install-Module Microsoft.Graph.Applications -Force -Scope CurrentUser
-
-
-PS C:\Users\3382> cd .\SharePoint%20Utilities\
 PS C:\Users\3382\SharePoint%20Utilities>         .\Setup-PnPAppRegistration.ps1 `
 >>             -AppName "PnP-OnCall-Automation" `
 >>             -CertOutputPath "E:\Master_Files" `
@@ -18,5 +10,9 @@ PS C:\Users\3382\SharePoint%20Utilities>         .\Setup-PnPAppRegistration.ps1 
 
 ━━━ Step 2: Generating self-signed certificate ━━━
 Enter a password to protect the PFX certificate: **********
-Setup-PnPAppRegistration.ps1: A parameter cannot be found that matches parameter name 'CertStoreLocation'.
+Join-Path: C:\Users\3382\SharePoint%20Utilities\Setup-PnPAppRegistration.ps1:121
+Line |
+ 121 |  $pfxPath = Join-Path $CertOutputPath "$AppName.pfx"
+     |             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     | Cannot find drive. A drive with the name 'E' does not exist.
 PS C:\Users\3382\SharePoint%20Utilities>
