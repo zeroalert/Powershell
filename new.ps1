@@ -109,7 +109,7 @@ Write-Success "Microsoft.Graph modules loaded"
 #region ── Step 2: Generate self-signed certificate ──
 Write-Step "Step 2: Generating self-signed certificate"
 
-$certSubject = "CN=$AppName"
+$certSubject = "CN:$AppName"
 $certNotAfter = (Get-Date).AddYears($CertValidityYears)
 
 # Prompt for PFX password if not provided
