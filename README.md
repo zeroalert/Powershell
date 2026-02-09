@@ -56,27 +56,8 @@ Finishing: PowerShell
 
 
 
-The script is failing at Connect-PnPOnline with a 403 Forbidden error. This is an authentication/authorization issue, not a code bug.
-Root cause: The credential stored in E:\Master_Files\GL_Creds.xml (exported via Export-CliXml) is being rejected by SharePoint Online. Common reasons:
-
-https://aka.ms/vscode-powershell
-Type 'help' to get help.
-
-PS C:\Users\3382\SharePoint%20Utilities>         .\Setup-PnPAppRegistration.ps1 `
->>             -AppName "PnP-OnCall-Automation" `
->>             -CertOutputPath "E:\Master_Files" `
->>             -SharePointUrl "https://wingsfinancialcu.sharepoint.com/sites/dr" `
->>             -TenantDomain "wingsfinancialcu.onmicrosoft.com"
-
-━━━ Step 1: Checking prerequisites ━━━
-  → Installing PnP.PowerShell module...
-  ✓ PnP.PowerShell loaded
-Import-Module: C:\Users\3382\SharePoint%20Utilities\Setup-PnPAppRegistration.ps1:104:5
-Line |
- 104 |      Import-Module $mod -Force
-     |      ~~~~~~~~~~~~~~~~~~~~~~~~~
-     | Could not load file or assembly 'Microsoft.Graph.Authentication, Version=2.29.1.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35'. Assembly with same name is already loaded
-PS C:\Users\3382\SharePoint%20Utilities> 
+Install-Module Microsoft.Graph.Authentication -Force -AllowClobber -Scope CurrentUser
+Install-Module Microsoft.Graph.Applications -Force -AllowClobber -Scope CurrentUser
 
 
 
