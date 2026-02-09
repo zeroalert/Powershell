@@ -147,10 +147,11 @@ Write-Success "CER exported to: $cerPath"
 #endregion
 
 #region ── Step 3: Connect to Microsoft Graph ──
-Write-Step "Step 3: Connecting to Microsoft Graph (interactive sign-in)"
+Write-Step "Step 3: Connecting to Microsoft Graph (device code sign-in)"
+Write-Info "A device code will be displayed — open a browser, go to https://microsoft.com/devicelogin, and enter the code."
 Write-Info "Sign in with a Global Admin or Application Administrator account."
 
-Connect-MgGraph -Scopes "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All" -TenantId $TenantDomain
+Connect-MgGraph -Scopes "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All" -TenantId $TenantDomain -UseDeviceCode
 Write-Success "Connected to Microsoft Graph"
 #endregion
 
