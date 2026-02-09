@@ -119,7 +119,7 @@ if (-not $CertPassword) {
 
 # Create the cert in the current user's personal store
 $cert = New-SelfSignedCertificate `
-    -Subject $certSubject `
+    -SubjectName $certSubject `
     -CertStoreLocation "Cert:\CurrentUser\My" `
     -KeyExportPolicy Exportable `
     -KeySpec Signature `
