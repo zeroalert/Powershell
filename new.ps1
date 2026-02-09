@@ -4,14 +4,16 @@
         PnP PowerShell app-only authentication to SharePoint Online.
 
     .DESCRIPTION
+        Uses Azure CLI (az) instead of Microsoft.Graph module to avoid MSAL conflicts.
+        
         This script:
-        1. Installs/imports required modules (PnP.PowerShell, Microsoft.Graph)
-        2. Creates a self-signed certificate (or uses an existing one)
-        3. Registers an Entra ID application with SharePoint API permissions
+        1. Verifies Azure CLI is installed and logged in
+        2. Generates a self-signed certificate (if not already present)
+        3. Creates an Entra ID App Registration
         4. Uploads the certificate to the app registration
-        5. Grants admin consent for the API permissions
-        6. Exports the PFX to the specified path for use by the build agent
-        7. Outputs a connection test command
+        5. Adds SharePoint API permissions
+        6. Creates a service principal and grants admin consent
+        7. Outputs connection details for the build agent
 
     .PARAMETER AppName
         Display name for the Entra ID App Registration.
@@ -32,13 +34,14 @@
         Your tenant domain (e.g., wingsfinancialcu.onmicrosoft.com).
 
     .NOTES
-        Run this script as a Global Admin or Application Administrator in Entra ID.
-        The script requires interactive sign-in for Microsoft Graph and admin consent.
+        Prerequisites:
+        - Azure CLI installed (https://aka.ms/installazurecli)
+        - Logged in as Global Admin or Application Administrator (az login)
+        - Do NOT import PnP.PowerShell in this session
 
     .EXAMPLE
         .\Setup-PnPAppRegistration.ps1 `
             -AppName "PnP-OnCall-Automation" `
-            -CertOutputPath "E:\Master_Files" `
             -SharePointUrl "https://wingsfinancialcu.sharepoint.com/sites/dr" `
             -TenantDomain "wingsfinancialcu.onmicrosoft.com"
 #>
@@ -83,52 +86,77 @@ function Write-Info {
 }
 #endregion
 
-#region ── Step 1: Prerequisites ──
-Write-Step "Step 1: Checking prerequisites"
+#region ── Step 1: Verify Azure CLI ──
+Write-Step "Step 1: Verifying Azure CLI"
 
-# PnP.PowerShell
-if (-not (Get-Module -ListAvailable -Name PnP.PowerShell)) {
-    Write-Info "Installing PnP.PowerShell module..."
-    Install-Module -Name PnP.PowerShell -Scope CurrentUser -Force -AllowClobber -Confirm:$false
+# Check az is installed
+try {
+    $azVersion = az version 2>$null | ConvertFrom-Json
+    Write-Success "Azure CLI installed: $($azVersion.'azure-cli')"
 }
-Import-Module PnP.PowerShell -Force
-Write-Success "PnP.PowerShell loaded"
+catch {
+    Write-Error "Azure CLI not found. Install from https://aka.ms/installazurecli"
+    exit 1
+}
 
-# Microsoft.Graph (for app registration + admin consent)
-$graphModules = @("Microsoft.Graph.Authentication", "Microsoft.Graph.Applications")
-foreach ($mod in $graphModules) {
-    if (-not (Get-Module -ListAvailable -Name $mod)) {
-        Write-Info "Installing $mod..."
-        Install-Module -Name $mod -Scope CurrentUser -Force -AllowClobber -Confirm:$false
-    }
-    Import-Module $mod -Force
+# Check logged in
+$account = az account show 2>$null | ConvertFrom-Json
+if (-not $account) {
+    Write-Info "Not logged in. Opening browser for authentication..."
+    az login --tenant $TenantDomain | Out-Null
+    $account = az account show | ConvertFrom-Json
 }
-Write-Success "Microsoft.Graph modules loaded"
+Write-Success "Logged in as: $($account.user.name)"
+Write-Info "Tenant: $($account.tenantId)"
 #endregion
 
-#region ── Step 2: Generate self-signed certificate ──
-Write-Step "Step 2: Generating self-signed certificate"
+#region ── Step 2: Generate or load certificate ──
+Write-Step "Step 2: Certificate"
 
-$certSubject = "CN=$AppName"
-$certNotAfter = (Get-Date).AddYears($CertValidityYears)
-
-# Prompt for PFX password if not provided
-if (-not $CertPassword) {
-    $CertPassword = Read-Host -Prompt "Enter a password to protect the PFX certificate" -AsSecureString
-}
-
-# Use PnP's certificate cmdlet (works natively in PS7)
 $pfxPath = Join-Path $CertOutputPath "$AppName.pfx"
 $cerPath = Join-Path $CertOutputPath "$AppName.cer"
 
-$certResult = New-PnPAzureCertificate `
-    -CommonName $AppName `
-    -OutPfx $pfxPath `
-    -OutCert $cerPath `
-    -ValidYears $CertValidityYears `
-    -CertificatePassword $CertPassword
+# Prompt for PFX password if not provided
+if (-not $CertPassword) {
+    $CertPassword = Read-Host -Prompt "Enter a password for the PFX certificate" -AsSecureString
+}
 
-# Load the exported PFX to get thumbprint and raw cert data for Graph API
+if (Test-Path $pfxPath) {
+    Write-Info "Found existing PFX at: $pfxPath — skipping generation."
+}
+else {
+    Write-Info "Generating self-signed certificate using .NET..."
+
+    $rsa = [System.Security.Cryptography.RSA]::Create(2048)
+    $certRequest = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+        "CN=$AppName",
+        $rsa,
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+        [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
+    )
+    $certNotAfter = (Get-Date).AddYears($CertValidityYears)
+    $generatedCert = $certRequest.CreateSelfSigned(
+        [System.DateTimeOffset]::Now,
+        [System.DateTimeOffset]::new($certNotAfter)
+    )
+
+    # Export PFX
+    $pfxBytes = $generatedCert.Export(
+        [System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx,
+        $CertPassword
+    )
+    [System.IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
+    Write-Success "PFX exported to: $pfxPath"
+
+    # Export CER
+    $cerBytes = $generatedCert.Export(
+        [System.Security.Cryptography.X509Certificates.X509ContentType]::Cert
+    )
+    [System.IO.File]::WriteAllBytes($cerPath, $cerBytes)
+    Write-Success "CER exported to: $cerPath"
+}
+
+# Load PFX to get details
 $certObj = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
     $pfxPath,
     $CertPassword,
@@ -136,144 +164,109 @@ $certObj = New-Object System.Security.Cryptography.X509Certificates.X509Certific
 )
 
 $certThumbprint = $certObj.Thumbprint
-$certBase64 = [System.Convert]::ToBase64String($certObj.GetRawCertData())
-$certNotAfterDate = $certObj.NotAfter
-$certNotBeforeDate = $certObj.NotBefore
-
-Write-Success "Certificate created: $certThumbprint"
-Write-Info "Valid until: $($certNotAfterDate.ToString('yyyy-MM-dd'))"
-Write-Success "PFX exported to: $pfxPath"
-Write-Success "CER exported to: $cerPath"
+Write-Success "Certificate thumbprint: $certThumbprint"
+Write-Info "Valid until: $($certObj.NotAfter.ToString('yyyy-MM-dd'))"
 #endregion
 
-#region ── Step 3: Connect to Microsoft Graph ──
-Write-Step "Step 3: Connecting to Microsoft Graph (device code sign-in)"
-Write-Info "A device code will be displayed — open a browser, go to https://microsoft.com/devicelogin, and enter the code."
-Write-Info "Sign in with a Global Admin or Application Administrator account."
-
-Connect-MgGraph -Scopes "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All" -TenantId $TenantDomain -UseDeviceCode
-Write-Success "Connected to Microsoft Graph"
-#endregion
-
-#region ── Step 4: Create App Registration ──
-Write-Step "Step 4: Creating Entra ID App Registration"
-
-# SharePoint Online API - well-known ID
-$sharepointResourceId = "00000003-0000-0ff1-ce00-000000000000"
-
-# Permission: Sites.FullControl.All (application) — covers read/write to all site collections
-# Use Sites.ReadWrite.All if you want narrower scope
-$permissions = @(
-    @{
-        # Sites.FullControl.All (Application)
-        Id   = "a82116e5-55eb-4c41-a434-62fe8a61c773"
-        Type = "Role"
-    },
-    @{
-        # Sites.ReadWrite.All (Application) — fallback / narrower option
-        Id   = "fbcd29d2-fcca-4405-aded-518d457caae4"
-        Type = "Role"
-    }
-)
-
-$requiredResourceAccess = @(
-    @{
-        ResourceAppId  = $sharepointResourceId
-        ResourceAccess = $permissions
-    }
-)
+#region ── Step 3: Create App Registration ──
+Write-Step "Step 3: Creating Entra ID App Registration"
 
 # Check if app already exists
-$existingApp = Get-MgApplication -Filter "displayName eq '$AppName'" -ErrorAction SilentlyContinue
+$existingApp = az ad app list --display-name $AppName --query "[0]" 2>$null | ConvertFrom-Json
+
 if ($existingApp) {
-    Write-Info "App '$AppName' already exists (AppId: $($existingApp.AppId)). Updating..."
-    $app = $existingApp
-    
-    # Update certificate
-    $keyCredential = @{
-        DisplayName = "$AppName Certificate"
-        Type        = "AsymmetricX509Cert"
-        Usage       = "Verify"
-        Key           = [System.Convert]::FromBase64String($certBase64)
-        StartDateTime = $certNotBeforeDate.ToUniversalTime()
-        EndDateTime   = $certNotAfterDate.ToUniversalTime()
-    }
-    Update-MgApplication -ApplicationId $app.Id -KeyCredentials @($keyCredential)
-    Write-Success "Updated certificate on existing app"
+    $appId = $existingApp.appId
+    $objectId = $existingApp.id
+    Write-Info "App '$AppName' already exists. AppId: $appId"
 }
 else {
-    # Create new app
-    $appParams = @{
-        DisplayName            = $AppName
-        SignInAudience         = "AzureADMyOrg"
-        RequiredResourceAccess = $requiredResourceAccess
-        KeyCredentials         = @(
-            @{
-                DisplayName   = "$AppName Certificate"
-                Type          = "AsymmetricX509Cert"
-                Usage         = "Verify"
-                Key           = [System.Convert]::FromBase64String($certBase64)
-                StartDateTime = $certNotBeforeDate.ToUniversalTime()
-                EndDateTime   = $certNotAfterDate.ToUniversalTime()
-            }
-        )
-    }
+    Write-Info "Creating new app registration..."
+    $newApp = az ad app create `
+        --display-name $AppName `
+        --sign-in-audience AzureADMyOrg | ConvertFrom-Json
 
-    $app = New-MgApplication @appParams
-    Write-Success "App Registration created: $($app.DisplayName)"
+    $appId = $newApp.appId
+    $objectId = $newApp.id
+    Write-Success "App created: $AppName"
+    Write-Info "Application (Client) ID: $appId"
 }
-
-Write-Info "Application (Client) ID: $($app.AppId)"
-Write-Info "Object ID:               $($app.Id)"
 #endregion
 
-#region ── Step 5: Create Service Principal + Grant Admin Consent ──
-Write-Step "Step 5: Creating Service Principal and granting admin consent"
+#region ── Step 4: Upload certificate ──
+Write-Step "Step 4: Uploading certificate to app registration"
+
+az ad app credential reset `
+    --id $appId `
+    --cert "@$cerPath" `
+    --append | Out-Null
+
+Write-Success "Certificate uploaded to app registration"
+#endregion
+
+#region ── Step 5: Add SharePoint API permissions ──
+Write-Step "Step 5: Adding SharePoint API permissions"
+
+# SharePoint Online API ID
+$sharepointApiId = "00000003-0000-0ff1-ce00-000000000000"
+
+# Sites.FullControl.All (Application) 
+$sitesFullControl = "a82116e5-55eb-4c41-a434-62fe8a61c773"
+
+# Sites.ReadWrite.All (Application)
+$sitesReadWrite = "fbcd29d2-fcca-4405-aded-518d457caae4"
+
+try {
+    az ad app permission add `
+        --id $appId `
+        --api $sharepointApiId `
+        --api-permissions "$sitesFullControl=Role" 2>$null | Out-Null
+    Write-Success "Added Sites.FullControl.All"
+}
+catch {
+    Write-Info "Sites.FullControl.All may already be added"
+}
+
+try {
+    az ad app permission add `
+        --id $appId `
+        --api $sharepointApiId `
+        --api-permissions "$sitesReadWrite=Role" 2>$null | Out-Null
+    Write-Success "Added Sites.ReadWrite.All"
+}
+catch {
+    Write-Info "Sites.ReadWrite.All may already be added"
+}
+#endregion
+
+#region ── Step 6: Create Service Principal + Admin Consent ──
+Write-Step "Step 6: Creating Service Principal and granting admin consent"
 
 # Create service principal if it doesn't exist
-$sp = Get-MgServicePrincipal -Filter "appId eq '$($app.AppId)'" -ErrorAction SilentlyContinue
-if (-not $sp) {
-    $sp = New-MgServicePrincipal -AppId $app.AppId
+$existingSP = az ad sp show --id $appId 2>$null | ConvertFrom-Json
+if (-not $existingSP) {
+    az ad sp create --id $appId | Out-Null
     Write-Success "Service Principal created"
 }
 else {
     Write-Success "Service Principal already exists"
 }
 
-# Get the SharePoint resource service principal
-$sharepointSP = Get-MgServicePrincipal -Filter "appId eq '$sharepointResourceId'"
+# Grant admin consent
+Write-Info "Granting admin consent (may take a moment)..."
+Start-Sleep -Seconds 5  # Brief pause for propagation
 
-if ($sharepointSP) {
-    foreach ($perm in $permissions) {
-        try {
-            $existingGrant = Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id |
-                Where-Object { $_.AppRoleId -eq $perm.Id }
-
-            if (-not $existingGrant) {
-                New-MgServicePrincipalAppRoleAssignment `
-                    -ServicePrincipalId $sp.Id `
-                    -PrincipalId $sp.Id `
-                    -ResourceId $sharepointSP.Id `
-                    -AppRoleId $perm.Id | Out-Null
-                Write-Success "Admin consent granted for permission: $($perm.Id)"
-            }
-            else {
-                Write-Success "Permission $($perm.Id) already consented"
-            }
-        }
-        catch {
-            Write-Warning "Could not grant permission $($perm.Id): $_"
-            Write-Info "You may need to grant admin consent manually in the Azure Portal."
-        }
-    }
+try {
+    az ad app permission admin-consent --id $appId 2>$null | Out-Null
+    Write-Success "Admin consent granted"
 }
-else {
-    Write-Warning "Could not find SharePoint Online service principal. Grant consent manually."
+catch {
+    Write-Warning "Auto-consent may have failed. Grant manually in Azure Portal:"
+    Write-Info "  Portal → Entra ID → App registrations → $AppName → API permissions → Grant admin consent"
 }
 #endregion
 
-#region ── Step 6: Summary + Connection Test ──
-Write-Step "Step 6: Setup Complete — Summary"
+#region ── Step 7: Summary ──
+Write-Step "Step 7: Setup Complete"
 
 $summary = @"
 
@@ -282,40 +275,35 @@ $summary = @"
 ╠══════════════════════════════════════════════════════════════╣
 ║                                                              ║
 ║  App Name:        $AppName
-║  Client ID:       $($app.AppId)
+║  Client ID:       $appId
 ║  Tenant:          $TenantDomain
 ║  Cert Thumbprint: $certThumbprint
 ║  PFX Location:    $pfxPath
-║  Cert Expires:    $($certNotAfterDate.ToString('yyyy-MM-dd'))
+║  Cert Expires:    $($certObj.NotAfter.ToString('yyyy-MM-dd'))
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 
-  ── Copy the PFX to your build agent ──
-  Copy-Item "$pfxPath" -Destination "E:\Master_Files\$AppName.pfx"
+  ── Next Steps ──
 
-  ── Test the connection ──
-  Connect-PnPOnline -Url "$SharePointUrl" ``
-      -ClientId "$($app.AppId)" ``
-      -Tenant "$TenantDomain" ``
-      -CertificatePath "E:\Master_Files\$AppName.pfx" ``
-      -CertificatePassword (ConvertTo-SecureString "YOUR_PFX_PASSWORD" -AsPlainText -Force)
+  1. Copy the PFX to your build agent:
+     Copy-Item "$pfxPath" -Destination "\\<agent-hostname>\E$\Master_Files\$AppName.pfx"
 
-  Get-PnPListItem -List "I.S. Emergency Contacts" -PageSize 5
+  2. Test the connection (in a PnP.PowerShell session):
+     Import-Module PnP.PowerShell
+     Connect-PnPOnline -Url "$SharePointUrl" ``
+         -ClientId "$appId" ``
+         -Tenant "$TenantDomain" ``
+         -CertificatePath "E:\Master_Files\$AppName.pfx" ``
+         -CertificatePassword (ConvertTo-SecureString "YOUR_PFX_PASSWORD" -AsPlainText -Force)
 
-  ── Update your Sharepoint_OnCall.ps1 ──
-  Replace the Connect-PnPOnline line and remove the Import-CliXml credential line.
-  See the companion script update notes for exact changes.
+     Get-PnPListItem -List "I.S. Emergency Contacts" -PageSize 5
+
+  3. Update Sharepoint_OnCall.ps1 on the build agent:
+     - Replace 'sharepointpnppowershellonline' with 'PnP.PowerShell'
+     - Remove the Import-CliXml credential line
+     - Replace Connect-PnPOnline with the cert-based version above
 
 "@
 
 Write-Host $summary -ForegroundColor White
-
-# Disconnect Graph
-Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-#endregion
-
-#region ── Step 7: Cleanup local cert store (optional) ──
-Write-Step "Step 7: Cleanup"
-Write-Info "The certificate was generated by PnP and exported to: $pfxPath"
-Write-Info "No local cert store cleanup needed — the cert only exists as PFX/CER files."
 #endregion
