@@ -52,3 +52,9 @@ At E:\Agent_SVC_Devops_GMSA_1\_work\53\s\SharePoint Utilities\Sharepoint_OnCall.
  
 ##[error]PowerShell exited with code '1'.
 Finishing: PowerShell
+
+
+
+
+The script is failing at Connect-PnPOnline with a 403 Forbidden error. This is an authentication/authorization issue, not a code bug.
+Root cause: The credential stored in E:\Master_Files\GL_Creds.xml (exported via Export-CliXml) is being rejected by SharePoint Online. Common reasons:
