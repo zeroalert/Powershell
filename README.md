@@ -1,13 +1,3 @@
-
-━━━ Step 1: Checking prerequisites ━━━
-  → Installing PnP.PowerShell module...
-  ✓ PnP.PowerShell loaded
-  → Installing Microsoft.Graph.Authentication...
-  → Installing Microsoft.Graph.Applications...
-WARNING: The version '2.35.1' of module 'Microsoft.Graph.Authentication' is currently in use. Retry the operation after closing the applications.
-  ✓ Microsoft.Graph modules loaded
-
 ━━━ Step 2: Generating self-signed certificate ━━━
 Enter a password to protect the PFX certificate: **********
-Setup-PnPAppRegistration.ps1: Parameter cannot be processed because the parameter name 'Subject' is ambiguous. Possible matches include: -SubjectName -SubjectAlternative.
-PS C:\Users\3382\SharePoint%20Utilities>
+Setup-PnPAppRegistration.ps1: Cannot validate argument on parameter 'SubjectName'. The argument "CN=PnP-OnCall-Automation" does not match the "^(CN|E|O|OU|C|ST|L):[^,:]+$" pattern. Supply an argument that matches "^(CN|E|O|OU|C|ST|L):[^,:]+$" and try the command again.
