@@ -128,10 +128,17 @@ $certResult = New-PnPAzureCertificate `
     -ValidYears $CertValidityYears `
     -CertificatePassword $CertPassword
 
-$certThumbprint = $certResult.Certificate.Thumbprint
-$certBase64 = $certResult.Certificate.GetRawCertDataString()
-$certNotAfterDate = $certResult.Certificate.NotAfter
-$certNotBeforeDate = $certResult.Certificate.NotBefore
+# Load the exported PFX to get thumbprint and raw cert data for Graph API
+$certObj = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+    $pfxPath,
+    $CertPassword,
+    [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+)
+
+$certThumbprint = $certObj.Thumbprint
+$certBase64 = [System.Convert]::ToBase64String($certObj.GetRawCertData())
+$certNotAfterDate = $certObj.NotAfter
+$certNotBeforeDate = $certObj.NotBefore
 
 Write-Success "Certificate created: $certThumbprint"
 Write-Info "Valid until: $($certNotAfterDate.ToString('yyyy-MM-dd'))"
