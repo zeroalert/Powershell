@@ -32,11 +32,27 @@ Install-Module PnP.PowerShell -RequiredVersion 2.12.0 -Scope CurrentUser -Force
 Get-Module PnP.PowerShell -ListAvailable | Select Version,ModuleBase
 
 
-Exit
-cmdlet  at command pipeline position 1
-Supply values for the following parameters:
-LogLocation: C:\
-PfxPassword: Firewall1!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Log Started
 VERBOSE: Performing the operation "Start-Transcript" on target "C:\Sharepoint_OnCall_0210260116.log".
 Transcript started, output file is C:\\Sharepoint_OnCall_0210260116.log
