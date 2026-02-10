@@ -16,7 +16,10 @@
 param (
 	[Parameter(Mandatory = $true, ValueFromPipeline = $true)]
 	[ValidateNotNullOrEmpty()]
-	[string]$LogLocation
+	[string]$LogLocation,
+
+	[Parameter(Mandatory = $true)]
+	[string]$PfxPassword
 )
 
 $Date = (Get-Date -Format MMdyhhmm)
@@ -40,7 +43,7 @@ $mailsmtp = "mail.wingsfinancial.local"
 $ClientId = "8fc81a03-df76-4090-adb1-28bd7d99d631"
 $TenantDomain = "wingsfinancialcu.onmicrosoft.com"
 $CertPath = "E:\Master_Files\PnP-OnCall-Automation.pfx"
-$CertPasswordPlain = "YOUR_PFX_PASSWORD_HERE"  # Replace with actual password, or use a secure method below
+$CertPasswordPlain = $PfxPassword
 $CertPassword = ConvertTo-SecureString $CertPasswordPlain -AsPlainText -Force
 
 #$CSVPath = "C:\winstall\ListData.csv"
