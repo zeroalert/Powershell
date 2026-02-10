@@ -1,14 +1,6 @@
-PS C:\Windows\system32> Save-Module -Name PnP.PowerShell -Path C:\Temp\PnPModule -RequiredVersion 2.12.0
+New-Item -ItemType Directory -Path C:\Temp\PnPModule -Force
 
-
-Save-Module : Cannot find the path 'C:\Temp\PnPModule' because it does not exist.
-At line:1 char:1
-+ Save-Module -Name PnP.PowerShell -Path C:\Temp\PnPModule -RequiredVer ...
-+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : InvalidOperation: (:) [Save-Module], InvalidOperationException
-    + FullyQualifiedErrorId : PathNotFound,Save-Module
- 
-
+Save-Module -Name PnP.PowerShell -Path C:\Temp\PnPModule -RequiredVersion 2.12.0
 
 
 
