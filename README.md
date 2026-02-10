@@ -1,11 +1,36 @@
-# Remove all Graph modules
-Uninstall-Module Microsoft.Graph.Authentication -AllVersions -Force -ErrorAction SilentlyContinue
-Uninstall-Module Microsoft.Graph.Applications -AllVersions -Force -ErrorAction SilentlyContinue
+schedules:
+- cron: "0 */3 * * *"
+  displayName: Every 3 Hours Everyday
+  branches:
+    include:
+    - main
+  always: true
 
-# Reinstall latest
-Install-Module Microsoft.Graph.Authentication -Force -Scope CurrentUser
-Install-Module Microsoft.Graph.Applications -Force -Scope CurrentUser
+resources:
+  repositories:
+  - repository: HelpDeskEmailFiles
+    type: git
+    name: DCS - System Engineers - Projects/HelpDeskEmailFiles
+    ref: main
+  - repository: self
 
-# Test Graph connection immediately (before loading anything else)
-Import-Module Microsoft.Graph.Authentication
-Connect-MgGraph -Scopes "Application.ReadWrite.All" -UseDeviceCode
+stages: 
+- stage: ONCallSync
+  displayName: Sync Sharepoint On Call
+  jobs:
+  - job: 'Sync'
+    displayName: Sync Sharepoint On Call
+    pool: 
+     name: 'General Windows Workers GMSA'
+    steps:
+    - checkout: HelpDeskEmailFiles
+    - checkout: self
+    - task: PowerShell@2
+      inputs:
+        filePath: '$(System.DefaultWorkingDirectory)\SharePoint Utilities\Sharepoint_OnCall.ps1'
+        arguments: '-LogLocation "$(Build.ArtifactStagingDirectory)"'
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'Logfile'
+        publishLocation: 'Container'
