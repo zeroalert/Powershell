@@ -969,16 +969,19 @@ body {
 	
 	#Get all items from list
 	$ListItems | ForEach-Object {
-		$ListItem  = Get-PnPProperty -ClientObject $_ -Property FieldValuesAsText
-		$ListRow = New-Object PSObject
-		$Counter++
-		Get-PnPField -List $ListName | ForEach-Object {
-			$ListRow | Add-Member -MemberType NoteProperty -name $_.InternalName -Value $ListItem[$_.InternalName]
-		}
-		#Filter records by Oncall and Oncall Backup       
-		if ($ListRow.On_x0020_Call -like "yes" -or $ListRow.On_x002d_CallBackup -like "yes") {
-			$ListDataCollection += $ListRow
-		} 
+	    $ListItem  = Get-PnPProperty -ClientObject $_ -Property FieldValuesAsText
+	    $ListRow = New-Object PSObject
+	    $Counter++
+	
+	    # MINIMAL FIX: don't enumerate fields (Get-PnPField), just pull the 4 fields you use
+	    foreach ($FieldName in @("Title","JobTitle","On_x0020_Call","On_x002d_CallBackup")) {
+	        $ListRow | Add-Member -MemberType NoteProperty -Name $FieldName -Value $ListItem[$FieldName]
+	    }
+	
+	    #Filter records by Oncall and Oncall Backup
+	    if ($ListRow.On_x0020_Call -like "yes" -or $ListRow.On_x002d_CallBackup -like "yes") {
+	        $ListDataCollection += $ListRow
+	    }
 	}
 
 	#Add Members to distribution group functions
