@@ -7,7 +7,7 @@
 	 Organization: 	Wings Financial Credit Union
 	 Filename:    	Sharepoint_OnCall_Change
 	 Updated:      	2026-02-10 - Migrated to PnP.PowerShell with cert-based app-only auth
-     Updated:      	2026-02-10 - PS7 prerequisites + hardened module checks + AD + -Verbos shim + env var fixes
+     Updated:      	2026-02-10 - PS7 prerequisites + module checks + AD + Verbos shim + PnP list read fix
 	===========================================================================
 	.DESCRIPTION
 		Script used to sync the on call sharepoint list to the AD user group for rotation of the on Call List. 
@@ -29,10 +29,8 @@ param (
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# PnP.PowerShell on your box required PS 7.4.6+ (per your earlier transcript error)
-if ($PSVersionTable.PSVersion.Major -lt 7 -or
-	($PSVersionTable.PSVersion.Major -eq 7 -and $PSVersionTable.PSVersion -lt [version]'7.4.6'))
-{
+# Your earlier error showed PnP.PowerShell on your box required PS 7.4.6+
+if ($PSVersionTable.PSVersion.Major -lt 7 -or $PSVersionTable.PSVersion -lt [version]'7.4.6') {
 	throw "This script must be run in PowerShell 7.4.6+ (pwsh). Current: $($PSVersionTable.PSVersion)"
 }
 
@@ -51,16 +49,12 @@ Write-Host "Log Started"
 Start-Transcript -Path (Join-Path $LogLocation $LogFileName) -Append -Force -Verbose
 
 try {
-	#Steve Armstrong
-	#5/7/2020
-	#Oncall Automation
 	#Config Parameter for sharepoint list
 	$SiteURL = "https://wingsfinancialcu.sharepoint.com/sites/dr"
 	$ListName = "I.S. Emergency Contacts"
 	$mailsmtp = "mail.wingsfinancial.local"
 
 	# ── App-only auth config ──
-	# Update these values from the setup script output
 	$ClientId = "8fc81a03-df76-4090-adb1-28bd7d99d631"
 	$TenantDomain = "wingsfinancialcu.onmicrosoft.com"
 	$CertPath = "E:\Master_Files\PnP-OnCall-Automation.pfx"
@@ -76,18 +70,17 @@ try {
 	# ---------------------------
 	# Modules
 	# ---------------------------
-
-	# ActiveDirectory module (RSAT) must exist on this box
 	try {
 		Import-Module ActiveDirectory -ErrorAction Stop
 	} catch {
 		throw "ActiveDirectory module not available. Install RSAT Active Directory tools on this machine. Error: $($_.Exception.Message)"
 	}
 
-	# Ensure PnP.PowerShell exists (install if possible)
 	if (-not (Get-Module -ListAvailable -Name PnP.PowerShell)) {
 		Write-Host "PnP.PowerShell not found. Attempting install (CurrentUser)..."
 		try {
+			# NuGet provider can fail if no internet/proxy; install best-effort.
+			try { Install-PackageProvider -Name NuGet -Force -ErrorAction SilentlyContinue | Out-Null } catch {}
 			Install-Module PnP.PowerShell -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
 		} catch {
 			throw "Unable to install PnP.PowerShell. Preinstall it or fix PowerShellGet/nuget/proxy. Error: $($_.Exception.Message)"
@@ -98,33 +91,32 @@ try {
 	Import-Module PnP.PowerShell -Force -WarningAction Ignore
 
 	# ---------------------------
-	# Compatibility shim for your typo "-Verbos"
-	# Instead of editing many lines, we wrap Add-ADPrincipalGroupMembership to accept -Verbos.
+	# FIX: accept your existing typo "-Verbos" WITHOUT breaking -Verbose
+	# (removes the 'Verbose defined multiple times' issue)
 	# ---------------------------
-	if (-not (Get-Command -Name Add-ADPrincipalGroupMembership -CommandType Function -ErrorAction SilentlyContinue)) {
-		$script:__RealAddADPrincipalGroupMembership = (Get-Command -Name Add-ADPrincipalGroupMembership -CommandType Cmdlet)
-		function Add-ADPrincipalGroupMembership {
-			[CmdletBinding(DefaultParameterSetName='Default')]
-			param(
-				[Parameter(Mandatory=$false, ValueFromPipeline=$true)]
-				$Identity,
+	$script:__RealAddADPrincipalGroupMembership = Get-Command -Name Add-ADPrincipalGroupMembership -CommandType Cmdlet -ErrorAction Stop
+	function Add-ADPrincipalGroupMembership {
+		[CmdletBinding(DefaultParameterSetName='Default')]
+		param(
+			[Parameter(ValueFromPipeline=$true)]
+			$Identity,
 
-				[Parameter(Mandatory=$true)]
-				[string[]]$MemberOf,
+			[Parameter(Mandatory=$true)]
+			[string[]]$MemberOf,
 
-				[switch]$Verbose,
-				[switch]$Verbos
-			)
-			process {
-				$invokeParams = @{
-					MemberOf = $MemberOf
-				}
+			[switch]$Verbos
+		)
+		process {
+			# If -Verbos was used anywhere, force verbose output for this call
+			$oldVP = $VerbosePreference
+			if ($Verbos) { $VerbosePreference = 'Continue' }
 
-				if ($null -ne $Identity) { $invokeParams.Identity = $Identity }
-				if ($Verbose -or $Verbos) { $invokeParams.Verbose = $true }
+			$invokeParams = @{ MemberOf = $MemberOf }
+			if ($null -ne $Identity) { $invokeParams.Identity = $Identity }
 
-				& $script:__RealAddADPrincipalGroupMembership @invokeParams
-			}
+			& $script:__RealAddADPrincipalGroupMembership @invokeParams
+
+			$VerbosePreference = $oldVP
 		}
 	}
 
@@ -135,17 +127,14 @@ try {
 		$Emailbody = "  
 <html>
 <style>
-body {
-  text-align: left
-}
+body { text-align: left }
 </style>
 <p>Hello $Team,</p>
 <p>The $EmailGroup has changed from $EmailNameOld to $EmailNameNew.</p>
 <p>The $EmailGroupSMS has changed from $EmailNameOldSMS to $EmailNameNewSMS.</p>
 <p>Thank you,</p>
 </body>"
-		
-		# ADO vs local friendly paths
+
 		$base = $env:SYSTEM_DEFAULTWORKINGDIRECTORY
 		if ([string]::IsNullOrWhiteSpace($base)) { $base = $PSScriptRoot }
 
@@ -182,49 +171,36 @@ body {
 		{
 			if ($syseng.On_x0020_Call -like "yes" -and $syseng.JobTitle -like $JobTitle)
 			{
-				#Setting On Call Group like Title in Sharepoint Site
 				$oncall = $syseng.Title
 				
-				#Gathering old Primary Email User
 				$OLDoncallgroupmember = Get-ADGroupMember -Identity $oncallgroup
 				$OLDoncallgroupmemberName = (Get-ADGroupMember -Identity $oncallgroup -Verbose).Name
 				
-				#Gathering old Primary SMS User
 				$GroupCNSMS = (get-adgroup $oncallgroupSMS).DistinguishedName
 				$OldOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				$OldOnCallSMSMemberDN = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) }).DistinguishedName
 				
-				#Writing to Log file Info
 				Write-Host "Current $oncallgroup has been identified as $OLDoncallgroupmemberName"
 				Write-Host "Current $oncallgroupSMS has been identified as $OLDOnCallSMSMemberName"
 				
-				#Removing Memebers of the Email and SMS Group
 				Remove-ADGroupMember -Identity $oncallgroup $OLDoncallgroupmember -Confirm:$false -Verbose
 				Get-ADGroup $GroupCNSMS | Set-ADObject -Remove @{ 'member' = $OldOnCallSMSMemberDN }
 				
-				#Adding in Current Sharepoint site Users to group
-				
-				#Adding into primary Email Group
 				Get-ADuser -Filter { (name -eq $oncall) -and (emailaddress -like "*@wingsfinancial.com") } -Properties * -Verbose | Add-ADPrincipalGroupMembership -MemberOf $oncallgroup -Verbos
 				
-				#Adding into primary SMS Group
 				$BetterToSearch = "*$oncall*"
 				$TextUserDN = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Name -like $BetterToSearch) })
 				Set-ADGroup -Identity $oncallgroupSMS -Add @{ 'member' = "$TextUserDN" } -verbose
 				
-				#Gathering New Primary Email User
 				$NEWoncallgroupmember = Get-ADGroupMember -Identity $oncallgroup
 				$NEWoncallgroupmembeName = (Get-ADGroupMember -Identity $oncallgroup -Verbose).Name
 				
-				#Gathering New Primary SMS User
 				$NewOnCallSMSMemberDN = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) }).DistinguishedName
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				
-				#Writing to Log file Info
 				Write-Host "Sharepoint for $oncallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $oncallgroupSMS has been identified as $NewOnCallSMSMemberName"
 				
-				#Sends email if group membership has changed
 				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
 				{
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
@@ -236,56 +212,40 @@ body {
 					$EmailGroupSMS = $oncallgroupSMS
 					Send-Email
 				}
-				else
-				{
-					Write-Host "No changes needed for $oncallgroup"
-				}
+				else { Write-Host "No changes needed for $oncallgroup" }
 			}
 			elseif ($syseng.On_x002d_CallBackup -like "yes" -and $syseng.JobTitle -like $JobTitle)
 			{
-				#Setting On Call Group like Title in Sharepoint Site
 				$oncall = $syseng.Title
 			
-				#Gathering old Secondary Email User
 				$OLDoncallgroupmember = Get-ADGroupMember -Identity $bkponcallgroup
 				$OLDoncallgroupmemberName = (Get-ADGroupMember -Identity $bkponcallgroup -Verbose).Name
 				
-				#Gathering old Secondary SMS User
 				$GroupCNSMS = (get-adgroup $bkponcallgroupSMS).DistinguishedName
 				$OldOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				$OldOnCallSMSMemberDN = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) }).DistinguishedName
 				
-				#Writing to Log file Info
 				Write-Host "Current $bkponcallgroup has been identified as $OLDoncallgroupmemberName"
 				Write-Host "Current $bkponcallgroupSMS has been identified as $OLDOnCallSMSMemberName"
 				
-				#Removing Memebers of the Email and SMS Group
 				Remove-ADGroupMember -Identity $bkponcallgroup $OLDoncallgroupmember -Confirm:$false -Verbose
 				Get-ADGroup $GroupCNSMS | Set-ADObject -Remove @{ 'member' = $OldOnCallSMSMemberDN }
 				
-				#Adding in Current Sharepoint site Users to group
-				
-				#Adding into Secondary Email Group
 				Get-ADuser -Filter { (name -eq $oncall) -and (emailaddress -like "*@wingsfinancial.com") } -Properties * -Verbose | Add-ADPrincipalGroupMembership -MemberOf $bkponcallgroup -Verbos
 				
-				#Adding into Secondary SMS Group
 				$BetterToSearch = "*$oncall*"
 				$TextUserDN = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Name -like $BetterToSearch) })
 				Set-ADGroup -Identity $bkponcallgroupSMS -Add @{ 'member' = "$TextUserDN" } -verbose
 				
-				#Gathering New Secondary Email User
 				$NEWoncallgroupmember = Get-ADGroupMember -Identity $bkponcallgroup
 				$NEWoncallgroupmembeName = (Get-ADGroupMember -Identity $bkponcallgroup -Verbose).Name
 				
-				#Gathering New Secondary SMS User
 				$NewOnCallSMSMemberDN = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) }).DistinguishedName
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				
-				#Writing to Log file Info
 				Write-Host "Sharepoint for $bkponcallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $bkponcallgroupSMS has been identified as $NewOnCallSMSMemberName"
 				
-				#Sends email if group membership has changed
 				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
 				{
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
@@ -297,10 +257,7 @@ body {
 					$EmailGroupSMS = $bkponcallgroupSMS
 					Send-Email
 				}
-				else
-				{
-					Write-Host "No changes needed for $bkponcallgroup"
-				}
+				else { Write-Host "No changes needed for $bkponcallgroup" }
 			}
 		}
 	}
@@ -341,8 +298,7 @@ body {
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				Write-Host "Sharepoint for $oncallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $oncallgroupSMS has been identified as $NewOnCallSMSMemberName"
-				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
-				{
+				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember") {
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
 					$EmailNameOld = $OLDoncallgroupmemberName
 					$EmailNameNew = $NEWoncallgroupmembeName
@@ -351,11 +307,7 @@ body {
 					$EmailNameNewSMS = $NewOnCallSMSMemberName
 					$EmailGroupSMS = $oncallgroupSMS
 					Send-Email
-				}
-				else
-				{
-					Write-Host "No changes needed for $oncallgroup"
-				}
+				} else { Write-Host "No changes needed for $oncallgroup" }
 			}
 			elseif ($syseng.On_x002d_CallBackup -like "yes" -and $syseng.JobTitle -like $JobTitle)
 			{
@@ -379,8 +331,7 @@ body {
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				Write-Host "Sharepoint for $bkponcallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $bkponcallgroupSMS has been identified as $NewOnCallSMSMemberName"
-				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
-				{
+				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember") {
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
 					$EmailNameOld = $OLDoncallgroupmemberName
 					$EmailNameNew = $NEWoncallgroupmembeName
@@ -389,11 +340,7 @@ body {
 					$EmailNameNewSMS = $NewOnCallSMSMemberName
 					$EmailGroupSMS = $bkponcallgroupSMS
 					Send-Email
-				}
-				else
-				{
-					Write-Host "No changes needed for $bkponcallgroup"
-				}
+				} else { Write-Host "No changes needed for $bkponcallgroup" }
 			}
 		}
 	}
@@ -434,8 +381,7 @@ body {
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				Write-Host "Sharepoint for $oncallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $oncallgroupSMS has been identified as $NewOnCallSMSMemberName"
-				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
-				{
+				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember") {
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
 					$EmailNameOld = $OLDoncallgroupmemberName
 					$EmailNameNew = $NEWoncallgroupmembeName
@@ -444,11 +390,7 @@ body {
 					$EmailNameNewSMS = $NewOnCallSMSMemberName
 					$EmailGroupSMS = $oncallgroupSMS
 					Send-Email
-				}
-				else
-				{
-					Write-Host "No changes needed for $oncallgroup"
-				}
+				} else { Write-Host "No changes needed for $oncallgroup" }
 			}
 			elseif ($syseng.On_x002d_CallBackup -like "yes" -and $syseng.JobTitle -like $JobTitle)
 			{
@@ -472,8 +414,7 @@ body {
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				Write-Host "Sharepoint for $bkponcallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $bkponcallgroupSMS has been identified as $NewOnCallSMSMemberName"
-				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
-				{
+				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember") {
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
 					$EmailNameOld = $OLDoncallgroupmemberName
 					$EmailNameNew = $NEWoncallgroupmembeName
@@ -482,11 +423,7 @@ body {
 					$EmailNameNewSMS = $NewOnCallSMSMemberName
 					$EmailGroupSMS = $bkponcallgroupSMS
 					Send-Email
-				}
-				else
-				{
-					Write-Host "No changes needed for $bkponcallgroup"
-				}
+				} else { Write-Host "No changes needed for $bkponcallgroup" }
 			}
 		}
 	}
@@ -527,8 +464,7 @@ body {
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				Write-Host "Sharepoint for $oncallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $oncallgroupSMS has been identified as $NewOnCallSMSMemberName"
-				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
-				{
+				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember") {
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
 					$EmailNameOld = $OLDoncallgroupmemberName
 					$EmailNameNew = $NEWoncallgroupmembeName
@@ -537,11 +473,7 @@ body {
 					$EmailNameNewSMS = $NewOnCallSMSMemberName
 					$EmailGroupSMS = $oncallgroupSMS
 					Send-Email
-				}
-				else
-				{
-					Write-Host "No changes needed for $oncallgroup"
-				}
+				} else { Write-Host "No changes needed for $oncallgroup" }
 			}
 			elseif ($syseng.On_x002d_CallBackup -like "yes" -and $syseng.JobTitle -like $JobTitle)
 			{
@@ -565,8 +497,7 @@ body {
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				Write-Host "Sharepoint for $bkponcallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $bkponcallgroupSMS has been identified as $NewOnCallSMSMemberName"
-				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
-				{
+				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember") {
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
 					$EmailNameOld = $OLDoncallgroupmemberName
 					$EmailNameNew = $NEWoncallgroupmembeName
@@ -575,11 +506,7 @@ body {
 					$EmailNameNewSMS = $NewOnCallSMSMemberName
 					$EmailGroupSMS = $bkponcallgroupSMS
 					Send-Email
-				}
-				else
-				{
-					Write-Host "No changes needed for $bkponcallgroup"
-				}
+				} else { Write-Host "No changes needed for $bkponcallgroup" }
 			}
 		}
 	}
@@ -620,8 +547,7 @@ body {
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				Write-Host "Sharepoint for $oncallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $oncallgroupSMS has been identified as $NewOnCallSMSMemberName"
-				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
-				{
+				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember") {
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
 					$EmailNameOld = $OLDoncallgroupmemberName
 					$EmailNameNew = $NEWoncallgroupmembeName
@@ -630,11 +556,7 @@ body {
 					$EmailNameNewSMS = $NewOnCallSMSMemberName
 					$EmailGroupSMS = $oncallgroupSMS
 					Send-Email
-				}
-				else
-				{
-					Write-Host "No changes needed for $oncallgroup"
-				}
+				} else { Write-Host "No changes needed for $oncallgroup" }
 			}
 			elseif ($syseng.On_x002d_CallBackup -like "yes" -and $syseng.JobTitle -like $JobTitle)
 			{
@@ -658,8 +580,7 @@ body {
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				Write-Host "Sharepoint for $bkponcallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $bkponcallgroupSMS has been identified as $NewOnCallSMSMemberName"
-				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
-				{
+				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember") {
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
 					$EmailNameOld = $OLDoncallgroupmemberName
 					$EmailNameNew = $NEWoncallgroupmembeName
@@ -668,11 +589,7 @@ body {
 					$EmailNameNewSMS = $NewOnCallSMSMemberName
 					$EmailGroupSMS = $bkponcallgroupSMS
 					Send-Email
-				}
-				else
-				{
-					Write-Host "No changes needed for $bkponcallgroup"
-				}
+				} else { Write-Host "No changes needed for $bkponcallgroup" }
 			}
 		}
 	}
@@ -713,8 +630,7 @@ body {
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				Write-Host "Sharepoint for $oncallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $oncallgroupSMS has been identified as $NewOnCallSMSMemberName"
-				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
-				{
+				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember") {
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
 					$EmailNameOld = $OLDoncallgroupmemberName
 					$EmailNameNew = $NEWoncallgroupmembeName
@@ -723,11 +639,7 @@ body {
 					$EmailNameNewSMS = $NewOnCallSMSMemberName
 					$EmailGroupSMS = $oncallgroupSMS
 					Send-Email
-				}
-				else
-				{
-					Write-Host "No changes needed for $oncallgroup"
-				}
+				} else { Write-Host "No changes needed for $oncallgroup" }
 			}
 			elseif ($syseng.On_x002d_CallBackup -like "yes" -and $syseng.JobTitle -like $JobTitle)
 			{
@@ -751,8 +663,7 @@ body {
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				Write-Host "Sharepoint for $bkponcallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $bkponcallgroupSMS has been identified as $NewOnCallSMSMemberName"
-				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
-				{
+				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember") {
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
 					$EmailNameOld = $OLDoncallgroupmemberName
 					$EmailNameNew = $NEWoncallgroupmembeName
@@ -761,11 +672,7 @@ body {
 					$EmailNameNewSMS = $NewOnCallSMSMemberName
 					$EmailGroupSMS = $bkponcallgroupSMS
 					Send-Email
-				}
-				else
-				{
-					Write-Host "No changes needed for $bkponcallgroup"
-				}
+				} else { Write-Host "No changes needed for $bkponcallgroup" }
 			}
 		}
 	}
@@ -805,8 +712,7 @@ body {
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				Write-Host "Sharepoint for $oncallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $oncallgroupSMS has been identified as $NewOnCallSMSMemberName"
-				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
-				{
+				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember") {
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
 					$EmailNameOld = $OLDoncallgroupmemberName
 					$EmailNameNew = $NEWoncallgroupmembeName
@@ -815,11 +721,7 @@ body {
 					$EmailNameNewSMS = $NewOnCallSMSMemberName
 					$EmailGroupSMS = $oncallgroupSMS
 					Send-Email
-				}
-				else
-				{
-					Write-Host "No changes needed for $oncallgroup"
-				}
+				} else { Write-Host "No changes needed for $oncallgroup" }
 			}
 			elseif ($syseng.On_x002d_CallBackup -like "yes" -and $syseng.JobTitle -like $JobTitle)
 			{
@@ -843,8 +745,7 @@ body {
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				Write-Host "Sharepoint for $bkponcallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $bkponcallgroupSMS has been identified as $NewOnCallSMSMemberName"
-				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
-				{
+				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember") {
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
 					$EmailNameOld = $OLDoncallgroupmemberName
 					$EmailNameNew = $NEWoncallgroupmembeName
@@ -853,11 +754,7 @@ body {
 					$EmailNameNewSMS = $NewOnCallSMSMemberName
 					$EmailGroupSMS = $bkponcallgroupSMS
 					Send-Email
-				}
-				else
-				{
-					Write-Host "No changes needed for $bkponcallgroup"
-				}
+				} else { Write-Host "No changes needed for $bkponcallgroup" }
 			}
 		}
 	}
@@ -897,8 +794,7 @@ body {
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				Write-Host "Sharepoint for $oncallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $oncallgroupSMS has been identified as $NewOnCallSMSMemberName"
-				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
-				{
+				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember") {
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
 					$EmailNameOld = $OLDoncallgroupmemberName
 					$EmailNameNew = $NEWoncallgroupmembeName
@@ -907,11 +803,7 @@ body {
 					$EmailNameNewSMS = $NewOnCallSMSMemberName
 					$EmailGroupSMS = $oncallgroupSMS
 					Send-Email
-				}
-				else
-				{
-					Write-Host "No changes needed for $oncallgroup"
-				}
+				} else { Write-Host "No changes needed for $oncallgroup" }
 			}
 			elseif ($syseng.On_x002d_CallBackup -like "yes" -and $syseng.JobTitle -like $JobTitle)
 			{
@@ -935,8 +827,7 @@ body {
 				$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -properties *).givenName
 				Write-Host "Sharepoint for $bkponcallgroup has been identified as $NEWoncallgroupmembeName"
 				Write-Host "Sharepoint for $bkponcallgroupSMS has been identified as $NewOnCallSMSMemberName"
-				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember")
-				{
+				If ("$NEWoncallgroupmember" -ne "$OLDoncallgroupmember") {
 					Write-Host "Sending out Email Since $NEWoncallgroupmember does not equal $OLDoncallgroupmember"
 					$EmailNameOld = $OLDoncallgroupmemberName
 					$EmailNameNew = $NEWoncallgroupmembeName
@@ -945,17 +836,13 @@ body {
 					$EmailNameNewSMS = $NewOnCallSMSMemberName
 					$EmailGroupSMS = $bkponcallgroupSMS
 					Send-Email
-				}
-				else
-				{
-					Write-Host "No changes needed for $bkponcallgroup"
-				}
+				} else { Write-Host "No changes needed for $bkponcallgroup" }
 			}
 		}
 	}
 
 	# ---------------------------
-	# Connect to PnP Online using certificate-based app-only auth
+	# Connect to SharePoint (PnP, app-only cert)
 	# ---------------------------
 	Write-Host "Connecting to SharePoint (app-only cert)"
 	Connect-PnPOnline -Url $SiteURL `
@@ -964,27 +851,28 @@ body {
 		-CertificatePath $CertPath `
 		-CertificatePassword $CertPassword
 
+	# ---------------------------
+	# FIX: DO NOT enumerate fields with Get-PnPField (caused "not initialized")
+	# Pull only the fields you use.
+	# ---------------------------
 	$Counter = 0
-	$ListItems = Get-PnPListItem -List $ListName 
-	
-	#Get all items from list
+	$ListItems = Get-PnPListItem -List $ListName -PageSize 2000
+
 	$ListItems | ForEach-Object {
-	    $ListItem  = Get-PnPProperty -ClientObject $_ -Property FieldValuesAsText
-	    $ListRow = New-Object PSObject
-	    $Counter++
-	
-	    # MINIMAL FIX: don't enumerate fields (Get-PnPField), just pull the 4 fields you use
-	    foreach ($FieldName in @("Title","JobTitle","On_x0020_Call","On_x002d_CallBackup")) {
-	        $ListRow | Add-Member -MemberType NoteProperty -Name $FieldName -Value $ListItem[$FieldName]
-	    }
-	
-	    #Filter records by Oncall and Oncall Backup
-	    if ($ListRow.On_x0020_Call -like "yes" -or $ListRow.On_x002d_CallBackup -like "yes") {
-	        $ListDataCollection += $ListRow
-	    }
+		$ListItem  = Get-PnPProperty -ClientObject $_ -Property FieldValuesAsText
+		$ListRow = New-Object PSObject
+		$Counter++
+
+		foreach ($FieldName in @("Title","JobTitle","On_x0020_Call","On_x002d_CallBackup")) {
+			$ListRow | Add-Member -MemberType NoteProperty -Name $FieldName -Value $ListItem[$FieldName]
+		}
+
+		if ($ListRow.On_x0020_Call -like "yes" -or $ListRow.On_x002d_CallBackup -like "yes") {
+			$ListDataCollection += $ListRow
+		}
 	}
 
-	#Add Members to distribution group functions
+	# Add Members to distribution group functions
 	Write-Host "Performing System Engineer Function"
 	Set-SystemEng
 	Write-Host "Performing DBA Function"
@@ -999,8 +887,6 @@ body {
 	Set-Retail
 	Write-Host "Performing Network Engineer Function"
 	Set-Net
-	# Write-Host "Performing Security Engineer Function"
-	# Set-sec
 	Write-Host "Performing TeleAdm Function"
 	Set-TeleAdm
 	Write-Host "Complete Exiting Now"
