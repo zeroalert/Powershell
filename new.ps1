@@ -1,309 +1,409 @@
 <#
-    .SYNOPSIS
-        Creates an Entra ID App Registration with a self-signed certificate for 
-        PnP PowerShell app-only authentication to SharePoint Online.
-
-    .DESCRIPTION
-        Uses Azure CLI (az) instead of Microsoft.Graph module to avoid MSAL conflicts.
-        
-        This script:
-        1. Verifies Azure CLI is installed and logged in
-        2. Generates a self-signed certificate (if not already present)
-        3. Creates an Entra ID App Registration
-        4. Uploads the certificate to the app registration
-        5. Adds SharePoint API permissions
-        6. Creates a service principal and grants admin consent
-        7. Outputs connection details for the build agent
-
-    .PARAMETER AppName
-        Display name for the Entra ID App Registration.
-
-    .PARAMETER CertOutputPath
-        Directory to export the PFX certificate file. Defaults to current directory.
-
-    .PARAMETER CertPassword
-        Password to protect the PFX file. Will prompt if not provided.
-
-    .PARAMETER CertValidityYears
-        How many years the self-signed cert is valid. Default: 2.
-
-    .PARAMETER SharePointUrl
-        Your SharePoint site URL for the connection test.
-
-    .PARAMETER TenantDomain
-        Your tenant domain (e.g., wingsfinancialcu.onmicrosoft.com).
-
-    .NOTES
-        Prerequisites:
-        - Azure CLI installed (https://aka.ms/installazurecli)
-        - Logged in as Global Admin or Application Administrator (az login)
-        - Do NOT import PnP.PowerShell in this session
-
-    .EXAMPLE
-        .\Setup-PnPAppRegistration.ps1 `
-            -AppName "PnP-OnCall-Automation" `
-            -SharePointUrl "https://wingsfinancialcu.sharepoint.com/sites/dr" `
-            -TenantDomain "wingsfinancialcu.onmicrosoft.com"
+	.NOTES
+	===========================================================================
+	 Created with: 	SAPIEN Technologies, Inc., PowerShell Studio 2019 v5.6.168
+	 Created on:   	10/29/2019 11:59 AM
+	 Created by:   Luke Barlow
+	 Organization: 	Wings Financial Credit Union
+	 Filename:    	Sharepoint_OnCall_Change
+	 Updated:      	2026-02-10 - Migrated to PnP.PowerShell with cert-based app-only auth
+	 Updated:      	2026-02-10 - PS7 prerequisites + hardened module checks + AD + env var fixes
+	 Updated:      	2026-02-10 - Refactored 8 duplicate Set-* functions into single
+	                              Set-OnCallRotation with config table + null guards
+	===========================================================================
+	.DESCRIPTION
+		Script used to sync the on call sharepoint list to the AD user group
+		for rotation of the On Call List.
 #>
 
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory = $false)]
-    [string]$AppName = "PnP-OnCall-Automation",
+	[Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+	[ValidateNotNullOrEmpty()]
+	[string]$LogLocation,
 
-    [Parameter(Mandatory = $false)]
-    [string]$CertOutputPath = (Get-Location).Path,
-
-    [Parameter(Mandatory = $false)]
-    [SecureString]$CertPassword,
-
-    [Parameter(Mandatory = $false)]
-    [int]$CertValidityYears = 2,
-
-    [Parameter(Mandatory = $false)]
-    [string]$SharePointUrl = "https://wingsfinancialcu.sharepoint.com/sites/dr",
-
-    [Parameter(Mandatory = $false)]
-    [string]$TenantDomain = "wingsfinancialcu.onmicrosoft.com"
+	[Parameter(Mandatory = $true)]
+	[string]$PfxPassword
 )
 
-$ErrorActionPreference = "Stop"
+# ---------------------------
+# Prereqs / Guards
+# ---------------------------
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-#region ── Helpers ──
-function Write-Step {
-    param([string]$Message)
-    Write-Host "`n━━━ $Message ━━━" -ForegroundColor Cyan
+if ($PSVersionTable.PSVersion.Major -lt 7 -or
+	($PSVersionTable.PSVersion.Major -eq 7 -and $PSVersionTable.PSVersion -lt [version]'7.4.6'))
+{
+	throw "This script must be run in PowerShell 7.4.6+ (pwsh). Current: $($PSVersionTable.PSVersion)"
 }
 
-function Write-Success {
-    param([string]$Message)
-    Write-Host "  ✓ $Message" -ForegroundColor Green
+if (-not (Test-Path -LiteralPath $LogLocation)) {
+	New-Item -ItemType Directory -Path $LogLocation -Force | Out-Null
 }
 
-function Write-Info {
-    param([string]$Message)
-    Write-Host "  → $Message" -ForegroundColor Yellow
-}
-#endregion
+# ---------------------------
+# Logging
+# ---------------------------
+$Date = (Get-Date -Format 'MMddyyHHmm')
+$LogFileName = "Sharepoint_OnCall_$Date.log"
 
-#region ── Step 1: Verify Azure CLI ──
-Write-Step "Step 1: Verifying Azure CLI"
-
-# Check az is installed
-try {
-    $azVersion = az version 2>$null | ConvertFrom-Json
-    Write-Success "Azure CLI installed: $($azVersion.'azure-cli')"
-}
-catch {
-    Write-Error "Azure CLI not found. Install from https://aka.ms/installazurecli"
-    exit 1
-}
-
-# Check logged in
-$account = az account show 2>$null | ConvertFrom-Json
-if (-not $account) {
-    Write-Info "Not logged in. Opening browser for authentication..."
-    az login --tenant $TenantDomain | Out-Null
-    $account = az account show | ConvertFrom-Json
-}
-Write-Success "Logged in as: $($account.user.name)"
-Write-Info "Tenant: $($account.tenantId)"
-#endregion
-
-#region ── Step 2: Generate or load certificate ──
-Write-Step "Step 2: Certificate"
-
-$pfxPath = Join-Path $CertOutputPath "$AppName.pfx"
-$cerPath = Join-Path $CertOutputPath "$AppName.cer"
-
-# Prompt for PFX password if not provided
-if (-not $CertPassword) {
-    $CertPassword = Read-Host -Prompt "Enter a password for the PFX certificate" -AsSecureString
-}
-
-if (Test-Path $pfxPath) {
-    Write-Info "Found existing PFX at: $pfxPath — skipping generation."
-}
-else {
-    Write-Info "Generating self-signed certificate using .NET..."
-
-    $rsa = [System.Security.Cryptography.RSA]::Create(2048)
-    $certRequest = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
-        "CN=$AppName",
-        $rsa,
-        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
-        [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
-    )
-    $certNotAfter = (Get-Date).AddYears($CertValidityYears)
-    $generatedCert = $certRequest.CreateSelfSigned(
-        [System.DateTimeOffset]::Now,
-        [System.DateTimeOffset]::new($certNotAfter)
-    )
-
-    # Export PFX
-    $pfxBytes = $generatedCert.Export(
-        [System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx,
-        $CertPassword
-    )
-    [System.IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
-    Write-Success "PFX exported to: $pfxPath"
-
-    # Export CER
-    $cerBytes = $generatedCert.Export(
-        [System.Security.Cryptography.X509Certificates.X509ContentType]::Cert
-    )
-    [System.IO.File]::WriteAllBytes($cerPath, $cerBytes)
-    Write-Success "CER exported to: $cerPath"
-}
-
-# Load PFX to get details
-$certObj = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-    $pfxPath,
-    $CertPassword,
-    [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
-)
-
-$certThumbprint = $certObj.Thumbprint
-Write-Success "Certificate thumbprint: $certThumbprint"
-Write-Info "Valid until: $($certObj.NotAfter.ToString('yyyy-MM-dd'))"
-#endregion
-
-#region ── Step 3: Create App Registration ──
-Write-Step "Step 3: Creating Entra ID App Registration"
-
-# Check if app already exists
-$existingApp = az ad app list --display-name $AppName --query "[0]" 2>$null | ConvertFrom-Json
-
-if ($existingApp) {
-    $appId = $existingApp.appId
-    $objectId = $existingApp.id
-    Write-Info "App '$AppName' already exists. AppId: $appId"
-}
-else {
-    Write-Info "Creating new app registration..."
-    $newApp = az ad app create `
-        --display-name $AppName `
-        --sign-in-audience AzureADMyOrg | ConvertFrom-Json
-
-    $appId = $newApp.appId
-    $objectId = $newApp.id
-    Write-Success "App created: $AppName"
-    Write-Info "Application (Client) ID: $appId"
-}
-#endregion
-
-#region ── Step 4: Upload certificate ──
-Write-Step "Step 4: Uploading certificate to app registration"
-
-az ad app credential reset `
-    --id $appId `
-    --cert "@$cerPath" `
-    --append | Out-Null
-
-Write-Success "Certificate uploaded to app registration"
-#endregion
-
-#region ── Step 5: Add SharePoint API permissions ──
-Write-Step "Step 5: Adding SharePoint API permissions"
-
-# SharePoint Online API ID
-$sharepointApiId = "00000003-0000-0ff1-ce00-000000000000"
-
-# Sites.FullControl.All (Application) 
-$sitesFullControl = "a82116e5-55eb-4c41-a434-62fe8a61c773"
-
-# Sites.ReadWrite.All (Application)
-$sitesReadWrite = "fbcd29d2-fcca-4405-aded-518d457caae4"
+Write-Host "Log Started"
+Start-Transcript -Path (Join-Path $LogLocation $LogFileName) -Append -Force -Verbose
 
 try {
-    az ad app permission add `
-        --id $appId `
-        --api $sharepointApiId `
-        --api-permissions "$sitesFullControl=Role" 2>$null | Out-Null
-    Write-Success "Added Sites.FullControl.All"
-}
-catch {
-    Write-Info "Sites.FullControl.All may already be added"
-}
+	# ---------------------------
+	# Config
+	# ---------------------------
+	$SiteURL       = "https://wingsfinancialcu.sharepoint.com/sites/dr"
+	$ListName      = "I.S. Emergency Contacts"
+	$mailsmtp      = "mail.wingsfinancial.local"
 
-try {
-    az ad app permission add `
-        --id $appId `
-        --api $sharepointApiId `
-        --api-permissions "$sitesReadWrite=Role" 2>$null | Out-Null
-    Write-Success "Added Sites.ReadWrite.All"
-}
-catch {
-    Write-Info "Sites.ReadWrite.All may already be added"
-}
-#endregion
+	# App-only auth
+	$ClientId         = "8fc81a03-df76-4090-adb1-28bd7d99d631"
+	$TenantDomain     = "wingsfinancialcu.onmicrosoft.com"
+	$CertPath         = "E:\Master_Files\PnP-OnCall-Automation.pfx"
+	$CertPassword     = ConvertTo-SecureString $PfxPassword -AsPlainText -Force
 
-#region ── Step 6: Create Service Principal + Admin Consent ──
-Write-Step "Step 6: Creating Service Principal and granting admin consent"
+	if (-not (Test-Path -LiteralPath $CertPath)) {
+		throw "PFX not found at: $CertPath"
+	}
 
-# Create service principal if it doesn't exist
-$existingSP = az ad sp show --id $appId 2>$null | ConvertFrom-Json
-if (-not $existingSP) {
-    az ad sp create --id $appId | Out-Null
-    Write-Success "Service Principal created"
-}
-else {
-    Write-Success "Service Principal already exists"
-}
+	$ListDataCollection = @()
 
-# Grant admin consent
-Write-Info "Granting admin consent (may take a moment)..."
-Start-Sleep -Seconds 5  # Brief pause for propagation
+	# ---------------------------
+	# Modules
+	# ---------------------------
+	try {
+		Import-Module ActiveDirectory -ErrorAction Stop
+	} catch {
+		throw "ActiveDirectory module not available. Install RSAT Active Directory tools. Error: $($_.Exception.Message)"
+	}
 
-try {
-    az ad app permission admin-consent --id $appId 2>$null | Out-Null
-    Write-Success "Admin consent granted"
-}
-catch {
-    Write-Warning "Auto-consent may have failed. Grant manually in Azure Portal:"
-    Write-Info "  Portal → Entra ID → App registrations → $AppName → API permissions → Grant admin consent"
-}
-#endregion
+	if (-not (Get-Module -ListAvailable -Name PnP.PowerShell)) {
+		Write-Host "PnP.PowerShell not found. Attempting install (CurrentUser)..."
+		try {
+			Install-Module PnP.PowerShell -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+		} catch {
+			throw "Unable to install PnP.PowerShell. Error: $($_.Exception.Message)"
+		}
+	}
 
-#region ── Step 7: Summary ──
-Write-Step "Step 7: Setup Complete"
+	Write-Host "Importing Module"
+	Import-Module PnP.PowerShell -Force -WarningAction Ignore
 
-$summary = @"
+	# ---------------------------
+	# Rotation config table — replaces 8 separate functions
+	# ---------------------------
+	$RotationConfigs = @(
+		@{
+			Label           = "System Engineer"
+			PrimaryEmail    = "Primary On Call Sys Engineer"
+			PrimarySMS      = "Primary On Call Sys Engineer SMS"
+			SecondaryEmail  = "Secondary On Call Sys Engineer"
+			SecondarySMS    = "Secondary On Call Sys Engineer SMS"
+			MailTo          = "DatacenterServices@wingsfinancial.com"
+			Team            = "System Engineers"
+			JobTitle        = "System Engineer*"
+		}
+		@{
+			Label           = "DBA"
+			PrimaryEmail    = "Primary On Call DBA"
+			PrimarySMS      = "Primary On Call DBA SMS"
+			SecondaryEmail  = "Secondary On Call DBA"
+			SecondarySMS    = "Secondary On Call DBA SMS"
+			MailTo          = "DatacenterServices@wingsfinancial.com"
+			Team            = "Database Administrators"
+			JobTitle        = "*database*"
+		}
+		@{
+			Label           = "Lending ASA"
+			PrimaryEmail    = "Primary On Call Lending ASA"
+			PrimarySMS      = "Primary On Call Lending ASA SMS"
+			SecondaryEmail  = "Secondary On Call Lending ASA"
+			SecondarySMS    = "Secondary On Call Lending ASA SMS"
+			MailTo          = "appsupport@wingsfinancial.com"
+			Team            = "ASA Team"
+			JobTitle        = "*Lending*"
+		}
+		@{
+			Label           = "Digital ASA"
+			PrimaryEmail    = "Primary On Call Digital ASA"
+			PrimarySMS      = "Primary On Call Digital ASA SMS"
+			SecondaryEmail  = "Secondary On Call Digital ASA"
+			SecondarySMS    = "Secondary On Call Digital ASA SMS"
+			MailTo          = "appsupport@wingsfinancial.com"
+			Team            = "ASA Team"
+			JobTitle        = "*Digital*"
+		}
+		@{
+			Label           = "Retail ASA"
+			PrimaryEmail    = "Primary On Call Retail ASA"
+			PrimarySMS      = "Primary On Call Retail ASA SMS"
+			SecondaryEmail  = "Secondary On Call Retail ASA"
+			SecondarySMS    = "Secondary On Call Retail ASA SMS"
+			MailTo          = "appsupport@wingsfinancial.com"
+			Team            = "ASA Team"
+			JobTitle        = "*Retail*"
+		}
+		@{
+			Label           = "BackOffice ASA"
+			PrimaryEmail    = "Primary On Call BackOffice ASA"
+			PrimarySMS      = "Primary On Call BackOffice ASA SMS"
+			SecondaryEmail  = "Secondary On Call BackOffice ASA"
+			SecondarySMS    = "Secondary On Call BackOffice ASA SMS"
+			MailTo          = "appsupport@wingsfinancial.com"
+			Team            = "ASA Team"
+			JobTitle        = "*BackOffice*"
+		}
+		@{
+			Label           = "Network Engineer"
+			PrimaryEmail    = "Primary On Call Network Engineer"
+			PrimarySMS      = "Primary On Call Network Engineer SMS"
+			SecondaryEmail  = "Secondary On Call Network Engineer"
+			SecondarySMS    = "Secondary On Call Network Engineer SMS"
+			MailTo          = "NTO@wingsfinancial.com"
+			Team            = "Network Engineers"
+			JobTitle        = "Network Eng*"
+		}
+		@{
+			Label           = "Telecom Administrator"
+			PrimaryEmail    = "Primary On Call Telecom Administrator"
+			PrimarySMS      = "Primary On Call Telecom Administrator SMS"
+			SecondaryEmail  = "Secondary On Call Telecom Administrator"
+			SecondarySMS    = "Secondary On Call Telecom Administrator SMS"
+			MailTo          = "NTO@wingsfinancial.com"
+			Team            = "Telecom Administrators"
+			JobTitle        = "Telecommunications Systems Admin*"
+		}
+		@{
+			Label           = "DevOps Engineer"
+			PrimaryEmail    = "Primary On Call DevOps Engineer"
+			PrimarySMS      = "Primary On Call DevOps Engineer SMS"
+			SecondaryEmail  = "Secondary On Call DevOps Engineer"
+			SecondarySMS    = "Secondary On Call DevOps Engineer SMS"
+			MailTo          = "DevOps@wingsfinancial.com"
+			Team            = "DevOps Engineer"
+			JobTitle        = "DevOp*"
+		}
+	)
 
-╔══════════════════════════════════════════════════════════════╗
-║  PnP App-Only Auth Setup Complete                           ║
-╠══════════════════════════════════════════════════════════════╣
-║                                                              ║
-║  App Name:        $AppName
-║  Client ID:       $appId
-║  Tenant:          $TenantDomain
-║  Cert Thumbprint: $certThumbprint
-║  PFX Location:    $pfxPath
-║  Cert Expires:    $($certObj.NotAfter.ToString('yyyy-MM-dd'))
-║                                                              ║
-╚══════════════════════════════════════════════════════════════╝
+	# ---------------------------
+	# Email helper
+	# ---------------------------
+	function Send-OnCallEmail {
+		param (
+			[string]$MailTo,
+			[string]$Team,
+			[string]$EmailGroup,
+			[string]$EmailGroupSMS,
+			[string]$OldName,
+			[string]$NewName,
+			[string]$OldNameSMS,
+			[string]$NewNameSMS
+		)
 
-  ── Next Steps ──
-
-  1. Copy the PFX to your build agent:
-     Copy-Item "$pfxPath" -Destination "\\<agent-hostname>\E$\Master_Files\$AppName.pfx"
-
-  2. Test the connection (in a PnP.PowerShell session):
-     Import-Module PnP.PowerShell
-     Connect-PnPOnline -Url "$SharePointUrl" ``
-         -ClientId "$appId" ``
-         -Tenant "$TenantDomain" ``
-         -CertificatePath "E:\Master_Files\$AppName.pfx" ``
-         -CertificatePassword (ConvertTo-SecureString "YOUR_PFX_PASSWORD" -AsPlainText -Force)
-
-     Get-PnPListItem -List "I.S. Emergency Contacts" -PageSize 5
-
-  3. Update Sharepoint_OnCall.ps1 on the build agent:
-     - Replace 'sharepointpnppowershellonline' with 'PnP.PowerShell'
-     - Remove the Import-CliXml credential line
-     - Replace Connect-PnPOnline with the cert-based version above
-
+		$mailfrom = "Oncall@wingsfinancial.com"
+		$mailsub  = "Oncall Group Membership has Changed"
+		$Emailbody = @"
+<html>
+<style>body { text-align: left }</style>
+<p>Hello $Team,</p>
+<p>The $EmailGroup has changed from $OldName to $NewName.</p>
+<p>The $EmailGroupSMS has changed from $OldNameSMS to $NewNameSMS.</p>
+<p>Thank you,</p>
+</body>
 "@
 
-Write-Host $summary -ForegroundColor White
-#endregion
+		$base = $env:SYSTEM_DEFAULTWORKINGDIRECTORY
+		if ([string]::IsNullOrWhiteSpace($base)) { $base = $PSScriptRoot }
+
+		$signaturePath = Join-Path $base "HelpDeskEmailFiles\HelpDesk.htm"
+		if (Test-Path -LiteralPath $signaturePath) {
+			$Emailbody += Get-Content $signaturePath -Raw
+		}
+
+		$att1 = Join-Path $base "HelpDeskEmailFiles\logo1.png"
+		$att2 = Join-Path $base "HelpDeskEmailFiles\logo2.png"
+		$attachments = @()
+		if (Test-Path -LiteralPath $att1) { $attachments += $att1 }
+		if (Test-Path -LiteralPath $att2) { $attachments += $att2 }
+
+		Send-MailMessage -From $mailfrom -To $MailTo -Body $Emailbody -BodyAsHtml `
+			-Subject $mailsub -SmtpServer $mailsmtp -Attachments $attachments
+	}
+
+	# ---------------------------
+	# Generic rotation function (replaces Set-SystemEng, Set-DBA, etc.)
+	# ---------------------------
+	function Set-OnCallRotation {
+		param (
+			[string]$EmailGroup,
+			[string]$SMSGroup,
+			[string]$MailTo,
+			[string]$Team,
+			[string]$JobTitle,
+			[string]$Label,
+			[ValidateSet("Primary","Secondary")]
+			[string]$Role,
+			[array]$ListData
+		)
+
+		foreach ($row in $ListData) {
+
+			# Skip rows that don't match this rotation's job title
+			if ($row.JobTitle -notlike $JobTitle) { continue }
+
+			# Only process the row that matches the role we're updating
+			if ($Role -eq "Primary"   -and $row.On_x0020_Call      -notlike "yes") { continue }
+			if ($Role -eq "Secondary" -and $row.On_x002d_CallBackup -notlike "yes") { continue }
+
+			$oncall        = $row.Title
+			$targetEmail   = $EmailGroup
+			$targetSMS     = $SMSGroup
+			$roleLabel     = $Role
+
+			Write-Host "Processing $roleLabel $Label : $oncall"
+
+			# ── Get OLD email group member (null-safe) ──
+			$oldMember     = Get-ADGroupMember -Identity $targetEmail -ErrorAction SilentlyContinue
+			$oldMemberName = if ($oldMember) { $oldMember.Name } else { $null }
+			if (-not $oldMember) {
+				Write-Host "  Email group '$targetEmail' has no current members"
+			}
+
+			# ── Get OLD SMS contact (null-safe) ──
+			$smsDN         = (Get-ADGroup $targetSMS).DistinguishedName
+			$oldSmsContact = Get-ADObject -Filter { (objectClass -eq "contact") -and (MemberOf -like $smsDN) } -Properties givenName, DistinguishedName -ErrorAction SilentlyContinue
+			$oldSmsName    = if ($oldSmsContact) { $oldSmsContact.givenName } else { $null }
+			$oldSmsDN      = if ($oldSmsContact) { $oldSmsContact.DistinguishedName } else { $null }
+			if (-not $oldSmsContact) {
+				Write-Host "  SMS group '$targetSMS' has no current contacts"
+			}
+
+			Write-Host "  Current email member : $oldMemberName"
+			Write-Host "  Current SMS contact  : $oldSmsName"
+
+			# ── Remove old members (only if they exist) ──
+			if ($oldMember) {
+				Remove-ADGroupMember -Identity $targetEmail -Members $oldMember -Confirm:$false -Verbose
+			}
+			if ($oldSmsDN) {
+				Get-ADGroup $smsDN | Set-ADObject -Remove @{ 'member' = $oldSmsDN }
+			}
+
+			# ── Add new email member ──
+			$newUser = Get-ADUser -Filter { (Name -eq $oncall) -and (EmailAddress -like "*@wingsfinancial.com") } -Properties * -ErrorAction SilentlyContinue
+			if ($newUser) {
+				Add-ADPrincipalGroupMembership -Identity $newUser -MemberOf $targetEmail -Verbose
+			} else {
+				Write-Warning "AD user not found for name '$oncall' — skipping email group add"
+			}
+
+			# ── Add new SMS contact ──
+			$searchPattern  = "*$oncall*"
+			$newSmsContact  = Get-ADObject -Filter { (objectClass -eq "contact") -and (Name -like $searchPattern) } -ErrorAction SilentlyContinue
+			if ($newSmsContact) {
+				Set-ADGroup -Identity $targetSMS -Add @{ 'member' = "$($newSmsContact.DistinguishedName)" } -Verbose
+			} else {
+				Write-Warning "SMS contact not found for pattern '$searchPattern' — skipping SMS group add"
+			}
+
+			# ── Read back new members for logging / comparison ──
+			$newMember     = Get-ADGroupMember -Identity $targetEmail -ErrorAction SilentlyContinue
+			$newMemberName = if ($newMember) { $newMember.Name } else { $null }
+
+			$newSmsResult  = Get-ADObject -Filter { (objectClass -eq "contact") -and (MemberOf -like $smsDN) } -Properties givenName -ErrorAction SilentlyContinue
+			$newSmsName    = if ($newSmsResult) { $newSmsResult.givenName } else { $null }
+
+			Write-Host "  New email member     : $newMemberName"
+			Write-Host "  New SMS contact      : $newSmsName"
+
+			# ── Send notification if membership changed ──
+			if ("$newMember" -ne "$oldMember") {
+				Write-Host "  Membership changed — sending email"
+				Send-OnCallEmail `
+					-MailTo       $MailTo `
+					-Team         $Team `
+					-EmailGroup   $targetEmail `
+					-EmailGroupSMS $targetSMS `
+					-OldName      $oldMemberName `
+					-NewName      $newMemberName `
+					-OldNameSMS   $oldSmsName `
+					-NewNameSMS   $newSmsName
+			} else {
+				Write-Host "  No changes needed for $targetEmail"
+			}
+		}
+	}
+
+	# ---------------------------
+	# Connect to SharePoint
+	# ---------------------------
+	Write-Host "Connecting to SharePoint (app-only cert)"
+	Connect-PnPOnline -Url $SiteURL `
+		-ClientId $ClientId `
+		-Tenant $TenantDomain `
+		-CertificatePath $CertPath `
+		-CertificatePassword $CertPassword
+
+	# ---------------------------
+	# Read SharePoint list
+	# ---------------------------
+	$ListItems = Get-PnPListItem -List $ListName
+
+	$ListItems | ForEach-Object {
+		$ListItem = Get-PnPProperty -ClientObject $_ -Property FieldValuesAsText
+		$ListRow  = New-Object PSObject
+
+		foreach ($FieldName in @("Title", "JobTitle", "On_x0020_Call", "On_x002d_CallBackup")) {
+			$ListRow | Add-Member -MemberType NoteProperty -Name $FieldName -Value $ListItem[$FieldName]
+		}
+
+		if ($ListRow.On_x0020_Call -like "yes" -or $ListRow.On_x002d_CallBackup -like "yes") {
+			$ListDataCollection += $ListRow
+		}
+	}
+
+	# ---------------------------
+	# Run all rotations from config table
+	# ---------------------------
+	foreach ($cfg in $RotationConfigs) {
+		Write-Host "`n===== Performing $($cfg.Label) rotation ====="
+
+		try {
+			# Primary
+			Set-OnCallRotation `
+				-EmailGroup $cfg.PrimaryEmail `
+				-SMSGroup   $cfg.PrimarySMS `
+				-MailTo     $cfg.MailTo `
+				-Team       $cfg.Team `
+				-JobTitle   $cfg.JobTitle `
+				-Label      $cfg.Label `
+				-Role       "Primary" `
+				-ListData   $ListDataCollection
+
+			# Secondary
+			Set-OnCallRotation `
+				-EmailGroup $cfg.SecondaryEmail `
+				-SMSGroup   $cfg.SecondarySMS `
+				-MailTo     $cfg.MailTo `
+				-Team       $cfg.Team `
+				-JobTitle   $cfg.JobTitle `
+				-Label      $cfg.Label `
+				-Role       "Secondary" `
+				-ListData   $ListDataCollection
+		}
+		catch {
+			Write-Warning "Failed processing $($cfg.Label) rotation: $($_.Exception.Message)"
+			continue
+		}
+	}
+
+	Write-Host "`nComplete — Exiting Now"
+}
+finally {
+	Stop-Transcript | Out-Null
+}
+
+exit
