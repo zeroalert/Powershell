@@ -8,6 +8,7 @@
 	 Filename:    	Sharepoint_OnCall_Change
 	 Updated:      	2026-02-10 - Migrated to PnP.PowerShell with cert-based app-only auth
      Updated:      	2026-02-10 - PS7 prerequisites + hardened module checks + Get-ADGroupMember .Name fix
+     Updated:       2026-02-10 - FIX: SMS contact givenName -> Name + safe DN removal (0/1/many)
 	===========================================================================
 
 	.DESCRIPTION
@@ -96,7 +97,6 @@ try {
 
 		$members = @(Get-ADGroupMember -Identity $GroupName -ErrorAction SilentlyContinue)
 
-		# handle empty / weird returns safely
 		$names = @($members | ForEach-Object {
 			if ($null -ne $_ -and $_.PSObject.Properties.Match('Name').Count -gt 0) { $_.Name }
 		} | Where-Object { $_ })
@@ -106,7 +106,6 @@ try {
 
 	# ---------------------------
 	# FIX #2: Keep your original "-Verbos" typo from breaking / causing duplicate -Verbose issues
-	# (Minimal change: lets your script keep using "-Verbos")
 	# ---------------------------
 	$script:__RealAddADPrincipalGroupMembership = (Get-Command Add-ADPrincipalGroupMembership -CommandType Cmdlet)
 	function Add-ADPrincipalGroupMembership {
@@ -166,11 +165,11 @@ try {
 	Write-Host "Running Function Sync"
 
 	# ---------------------------
-	# Shared AD update helper (keeps your logic, just centralizes the repeated bits)
+	# Shared AD update helper
 	# ---------------------------
 	function Update-OnCallGroups {
 		param(
-			[Parameter(Mandatory=$true)][string]$OnCallName,       # e.g. "Dan Madigan" from SharePoint Title
+			[Parameter(Mandatory=$true)][string]$OnCallName,
 			[Parameter(Mandatory=$true)][string]$PrimaryGroup,
 			[Parameter(Mandatory=$true)][string]$PrimaryGroupSMS,
 			[Parameter(Mandatory=$true)][string]$MailTo,
@@ -182,12 +181,18 @@ try {
 
 		# Old members (safe)
 		$oldEmailNames = Get-GroupMemberNames $PrimaryGroup
-		$oldSmsNames   = ""
 
+		# --- FIX: SMS contact lookup SAFE (no givenName) ---
 		$GroupCNSMS = (Get-ADGroup $PrimaryGroupSMS).DistinguishedName
-		$OldOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -Properties * -ErrorAction SilentlyContinue).givenName
-		$OldOnCallSMSMemberDN   = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -ErrorAction SilentlyContinue).DistinguishedName
-		$oldSmsNames = ($OldOnCallSMSMemberName -join ", ")
+
+		$oldSmsObjs = @(
+			Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } `
+				-Properties distinguishedName,name `
+				-ErrorAction SilentlyContinue
+		)
+
+		$OldOnCallSMSMemberDN = @($oldSmsObjs | Select-Object -ExpandProperty DistinguishedName -ErrorAction SilentlyContinue)
+		$oldSmsNames = (@($oldSmsObjs | Select-Object -ExpandProperty Name -ErrorAction SilentlyContinue) -join ", ")
 
 		Write-Host "Current $PrimaryGroup has been identified as $oldEmailNames"
 		Write-Host "Current $PrimaryGroupSMS has been identified as $oldSmsNames"
@@ -198,9 +203,11 @@ try {
 			Remove-ADGroupMember -Identity $PrimaryGroup -Members $oldEmailMembers -Confirm:$false -Verbose
 		}
 
-		# Remove old SMS contact member (if any)
-		if ($OldOnCallSMSMemberDN) {
-			Get-ADGroup $GroupCNSMS | Set-ADObject -Remove @{ 'member' = $OldOnCallSMSMemberDN }
+		# --- FIX: Remove old SMS contact member(s) safely ---
+		if ($OldOnCallSMSMemberDN.Count -gt 0) {
+			foreach ($dn in $OldOnCallSMSMemberDN) {
+				if ($dn) { Get-ADGroup $GroupCNSMS | Set-ADObject -Remove @{ 'member' = $dn } }
+			}
 		}
 
 		# Add new email member
@@ -216,8 +223,14 @@ try {
 
 		# New members (safe)
 		$newEmailNames = Get-GroupMemberNames $PrimaryGroup
-		$NewOnCallSMSMemberName = (Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } -Properties * -ErrorAction SilentlyContinue).givenName
-		$newSmsNames = ($NewOnCallSMSMemberName -join ", ")
+
+		# --- FIX: new SMS names SAFE (no givenName) ---
+		$newSmsObjs = @(
+			Get-ADObject -Filter { (objectClass -eq "contact") -and (Memberof -like $GroupCNSMS) } `
+				-Properties name `
+				-ErrorAction SilentlyContinue
+		)
+		$newSmsNames = (@($newSmsObjs | Select-Object -ExpandProperty Name -ErrorAction SilentlyContinue) -join ", ")
 
 		Write-Host "Sharepoint for $PrimaryGroup has been identified as $newEmailNames"
 		Write-Host "Sharepoint for $PrimaryGroupSMS has been identified as $newSmsNames"
@@ -225,12 +238,12 @@ try {
 		# Email notification if changed
 		if ("$newEmailNames" -ne "$oldEmailNames") {
 			Write-Host "Sending out Email Since $newEmailNames does not equal $oldEmailNames"
-			$script:EmailNameOld   = $oldEmailNames
-			$script:EmailNameNew   = $newEmailNames
-			$script:EmailGroup     = $PrimaryGroup
-			$script:EmailNameOldSMS= $oldSmsNames
-			$script:EmailNameNewSMS= $newSmsNames
-			$script:EmailGroupSMS  = $PrimaryGroupSMS
+			$script:EmailNameOld    = $oldEmailNames
+			$script:EmailNameNew    = $newEmailNames
+			$script:EmailGroup      = $PrimaryGroup
+			$script:EmailNameOldSMS = $oldSmsNames
+			$script:EmailNameNewSMS = $newSmsNames
+			$script:EmailGroupSMS   = $PrimaryGroupSMS
 			Send-Email
 		} else {
 			Write-Host "No changes needed for $PrimaryGroup"
@@ -238,7 +251,7 @@ try {
 	}
 
 	# ---------------------------
-	# Your Set-* functions (same behavior, just call helper)
+	# Your Set-* functions (unchanged behavior)
 	# ---------------------------
 
 	function Set-SystemEng {
@@ -412,9 +425,7 @@ try {
 		-CertificatePassword $CertPassword
 
 	# ---------------------------
-	# SharePoint read
-	# FIX #3: Don't call Get-PnPField (your earlier "field not initialized" issue)
-	# Just pull the fields you actually use.
+	# SharePoint read (no Get-PnPField)
 	# ---------------------------
 	$Counter = 0
 	$ListItems = Get-PnPListItem -List $ListName -PageSize 2000
@@ -423,10 +434,10 @@ try {
 		$ListItem = Get-PnPProperty -ClientObject $item -Property FieldValuesAsText
 
 		$ListRow = [pscustomobject]@{
-			Title              = $ListItem["Title"]
-			JobTitle           = $ListItem["JobTitle"]
-			On_x0020_Call      = $ListItem["On_x0020_Call"]
-			On_x002d_CallBackup= $ListItem["On_x002d_CallBackup"]
+			Title               = $ListItem["Title"]
+			JobTitle            = $ListItem["JobTitle"]
+			On_x0020_Call       = $ListItem["On_x0020_Call"]
+			On_x002d_CallBackup = $ListItem["On_x002d_CallBackup"]
 		}
 
 		if ($ListRow.On_x0020_Call -like "yes" -or $ListRow.On_x002d_CallBackup -like "yes") {
